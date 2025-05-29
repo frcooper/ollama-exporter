@@ -1,7 +1,7 @@
 import os
 import time
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # Configurable Ollama host (via env variable or defaults to localhost)
@@ -19,7 +19,7 @@ LOAD_TIME = Histogram("ollama_load_time_seconds", "Time taken to load models", [
 @app.get("/metrics")
 def metrics():
     """Expose Prometheus metrics."""
-    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
+    return Response(content=generate_latest(), media_type="text/plain")
 
 @app.post("/api/generate")
 async def generate(request: Request):
