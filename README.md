@@ -81,5 +81,23 @@ docker restart <prometheus-container-name>
 
 All other endpoints are proxied to the Ollama API.
 
+## Usage Scenario
+
+Suppose you want to monitor your local Ollama instance with Prometheus using this exporter:
+
+1. **Start Ollama** locally (default: `http://localhost:11434`).
+2. **Run the exporter** on your machine:
+   ```sh
+   OLLAMA_HOST=http://localhost:11434 python ollama_exporter.py
+   # or with Docker:
+   # docker run -d -p 8000:8000 -e OLLAMA_HOST="http://localhost:11434" ollama-exporter
+   ```
+3. **Configure your application (eg Open WebUI)** to use the exporter as the API endpoint:
+   - Set `OLLAMA_HOST=http://localhost:8000` (the exporter will proxy and collect metrics).
+4. **Prometheus** scrapes metrics from the exporter:
+   - Add `localhost:8000/metrics` to your Prometheus scrape config.
+
+This setup allows you to transparently monitor all Ollama API usage and performance via Prometheus and Grafana dashboards.
+
 ## License
 There is no spoon.

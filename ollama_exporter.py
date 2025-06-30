@@ -1,4 +1,5 @@
 import os
+import asyncio
 import httpx
 import json
 import logging
@@ -155,5 +156,27 @@ async def simple_proxy(request: Request, path: str):
     logger.debug(f"Proxy response: {response.status_code} for {request.method} /{path}")
     return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
 
+async def verify_ollama_connection():
+    """Verify connection to Ollama server at startup."""
+    logger.debug(f"Verifying connection to Ollama server at {OLLAMA_HOST}")
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            response = await client.get(f"{OLLAMA_HOST}/api/version")
+            if response.status_code == 200:
+                version_data = response.json()
+                logger.info(f"Connected to Ollama")
+            else:
+                logger.error(f"Failed to connect to Ollama server. Status code: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Failed to connect to Ollama server at {OLLAMA_HOST}: {e}")
+        logger.error("Please ensure Ollama is running and accessible at the configured host")
+
+async def main():
+    await verify_ollama_connection()
+    config = uvicorn.Config(app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    asyncio.run(main())
