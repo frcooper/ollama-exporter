@@ -27,6 +27,20 @@ Requests sent directly to Ollama are not visible to the exporter.
 
 ## Installation
 
+### Pinning a Release
+
+Choose a version from [GitHub Releases](https://github.com/frcooper/ollama-exporter/releases),
+then download its source archive or check out its tag:
+
+```sh
+git clone --branch v0.1.0 --depth 1 https://github.com/frcooper/ollama-exporter.git
+cd ollama-exporter
+```
+
+Use that checkout for the Python, Docker, or WSLC instructions below. Releases
+include both Grafana dashboards. Container images are built locally; this
+project does not publish images. Published release tags are immutable.
+
 ### Running Locally
 
 #### 1. Install Dependencies
@@ -295,7 +309,11 @@ downloaded models, or a GPU. CI runs the tests on Python 3.11–3.14 and checks
 that the container builds.
 Direct dependencies are pinned in `requirements.txt`; Docker uses that same
 file. Dependabot checks Python packages, the Docker base, and Actions monthly.
-The CI workflow validates changes and does not publish images or releases.
+The CI workflow validates changes. A separate, manually started release
+workflow reruns those checks before publishing a versioned source release;
+neither workflow publishes container images. See the
+[release procedure](.github/RELEASING.md). Documentation, tests, and CI changes
+alone do not trigger a release.
 
 Changes to `main` go through a pull request. The four Python checks and the
 container build must pass, the branch must be current with `main`, and review
@@ -304,8 +322,9 @@ force pushes and deletion of `main` are disabled. No second reviewer is
 required for this single-maintainer repository.
 
 CI uses a read-only `GITHUB_TOKEN`, does not retain checkout credentials, and
-cannot approve pull requests. Fork workflows from first-time contributors
-require maintainer approval.
+cannot approve pull requests. Only the release publishing job has repository
+contents write access. Fork workflows from first-time contributors require
+maintainer approval.
 
 ## Live Validation
 

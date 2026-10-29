@@ -1,0 +1,97 @@
+name: Release
+run-name: Release ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New stable version (for example, v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate version and release scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo 'Use a stable version such as v0.1.0, without leading zeroes.' >&2
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "Tag $VERSION already exists; published versions must never move." >&2
+            exit 1
+          fi
+          previous=$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[0].tagName // empty')
+          if [[ -n "$previous" ]]; then
+            newest=$(printf '%s\n' "$previous" "$VERSION" | sort -V | tail -n 1)
+            if [[ "$newest" != "$VERSION" || "$previous" == "$VERSION" ]]; then
+              echo "Version must be newer than $previous." >&2
+              exit 1
+            fi
+            git merge-base --is-ancestor "$previous" "$GITHUB_SHA"
+            changed=$(git diff --name-only "$previous" "$GITHUB_SHA" -- \
+              ollama_exporter.py requirements.txt Dockerfile dashboard.json dashboard_custom.json)
+            if [[ -z "$changed" ]]; then
+              echo 'No shipped files changed; docs, tests, and CI alone do not warrant a release.' >&2
+              exit 1
+            fi
+          fi
+
+  validate:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the tested commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Explicit creation fails if another actor created this tag while CI ran.
+          gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f "ref=refs/tags/$VERSION" -f "sha=$GITHUB_SHA"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Source release of Ollama Exporter. Pin this version with:
+
+          \`\`\`sh
+          git clone --branch $VERSION --depth 1 https://github.com/$GH_REPO.git
+          \`\`\`
+
+          The source archives include the exporter, pinned direct dependencies,
+          Dockerfile, and both Grafana dashboards. Build container images locally;
+          this project does not publish container images.
+
+          Released commit: $GITHUB_SHA. Python 3.11–3.14 tests and the container
+          build passed for this exact commit before publication.
+          EOF
+          gh release create "$VERSION" --verify-tag --title "$VERSION" \
+            --generate-notes --notes-file "$RUNNER_TEMP/release-notes.md"
