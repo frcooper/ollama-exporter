@@ -38,6 +38,44 @@ OLLAMA_TOKENS_PER_SECOND = Histogram(
 )
 
 
+# Headers that describe the upstream connection/framing and must never be
+# forwarded verbatim. Ollama answers with `Transfer-Encoding: chunked`; once we
+# buffer the body and hand it to Starlette, Starlette adds its own
+# `Content-Length`. A response carrying both is illegal (RFC 9112 s6.1) and
+# strict clients reject it outright - aiohttp (Open WebUI) fails the request
+# with "Content-Length can't be present with Transfer-Encoding" while lenient
+# ones like curl let it slide.
+HOP_BY_HOP_HEADERS = frozenset({
+    "connection",
+    "content-encoding",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+})
+
+
+def sanitize_response_headers(headers):
+    """Strip hop-by-hop headers from an upstream response before forwarding.
+
+    Parameters
+    ----------
+    headers : Mapping[str, str]
+        Headers as returned by the upstream Ollama response.
+
+    Returns
+    -------
+    dict of str to str
+        The same headers minus every entry in :data:`HOP_BY_HOP_HEADERS`, safe
+        to hand back to Starlette which recomputes the framing itself.
+    """
+    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+
+
 def extract_and_record_metrics(response_data, model):
     """Extract and record metrics from Ollama response data."""
     if not isinstance(response_data, dict):
@@ -147,7 +185,7 @@ async def chat_with_metrics(request: Request):
                 except (json.JSONDecodeError, TypeError):
                     pass
 
-            return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+            return Response(content=response.content, status_code=response.status_code, headers=sanitize_response_headers(response.headers))
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
 async def simple_proxy(request: Request, path: str):
@@ -161,7 +199,7 @@ async def simple_proxy(request: Request, path: str):
         response = await client.request(method=request.method, url=f"{OLLAMA_HOST}/{path}", headers=headers, content=await request.body(), params=request.query_params)
 
     logger.debug(f"Proxy response: {response.status_code} for {request.method} /{path}")
-    return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+    return Response(content=response.content, status_code=response.status_code, headers=sanitize_response_headers(response.headers))
 
 async def verify_ollama_connection():
     """Verify connection to Ollama server at startup."""
