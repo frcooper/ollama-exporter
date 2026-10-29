@@ -18,12 +18,13 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 15,
+  "id": null,
   "links": [],
   "panels": [
     {
       "datasource": {
-        "type": "prometheus"
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -71,19 +72,24 @@
       "targets": [
         {
           "datasource": {
-            "type": "prometheus"
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (model) (ollama_requests_total)",
+          "expr": "sum by (model) (increase(ollama_requests_total[$__range]))",
           "format": "time_series",
-          "refId": "A"
+          "refId": "A",
+          "instant": true,
+          "range": false
         }
       ],
-      "title": "Total Requests Per Model",
-      "type": "stat"
+      "title": "Requests by Model (Selected Range)",
+      "type": "stat",
+      "description": "Estimated requests in the selected time range, adjusted for counter resets. Prometheus needs at least two samples per series; requests before its first scrape cannot be recovered."
     },
     {
       "datasource": {
-        "type": "prometheus"
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -123,7 +129,7 @@
           "color": "rgba(255,0,255,0.7)"
         },
         "filterValues": {
-          "le": 1e-9
+          "le": 1e-09
         },
         "legend": {
           "show": true
@@ -146,24 +152,26 @@
       "targets": [
         {
           "datasource": {
-            "type": "prometheus"
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "ollama_tokens_per_second_bucket",
+          "expr": "sum by (le) (increase(ollama_tokens_per_second_bucket[$__rate_interval]))",
           "format": "heatmap",
           "hide": false,
           "instant": false,
-          "legendFormat": "__auto",
+          "legendFormat": "{{le}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Count of responses by Token/s",
+      "title": "Generation Speed Distribution",
       "type": "heatmap"
     },
     {
       "datasource": {
-        "type": "prometheus"
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -243,9 +251,10 @@
       "targets": [
         {
           "datasource": {
-            "type": "prometheus"
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(ollama_response_seconds_bucket[5m])) by (le, model))",
+          "expr": "histogram_quantile(0.95, sum(rate(ollama_response_seconds_bucket[$__rate_interval])) by (le, model))",
           "format": "time_series",
           "refId": "A"
         }
@@ -255,7 +264,8 @@
     },
     {
       "datasource": {
-        "type": "prometheus"
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -303,9 +313,10 @@
       "targets": [
         {
           "datasource": {
-            "type": "prometheus"
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (model) (rate(ollama_tokens_generated_total[5m]))",
+          "expr": "sum by (model) (rate(ollama_tokens_generated_total[$__rate_interval]))",
           "format": "time_series",
           "refId": "A"
         }
@@ -315,7 +326,8 @@
     },
     {
       "datasource": {
-        "type": "prometheus"
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -395,20 +407,21 @@
       "targets": [
         {
           "datasource": {
-            "type": "prometheus"
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (model) (rate(ollama_eval_total[5m]))",
+          "expr": "sum by (model) (rate(ollama_tokens_processed_total[$__rate_interval]))",
           "format": "time_series",
           "refId": "A"
         }
       ],
-      "title": "Evaluation Steps",
+      "title": "Prompt Tokens Processed per Second",
       "type": "timeseries"
     },
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "fenqsyb8rfke8c"
+        "uid": "${DS_PROMETHEUS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -488,9 +501,10 @@
       "targets": [
         {
           "datasource": {
-            "type": "prometheus"
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(ollama_load_time_seconds_bucket[5m])) by (le, model))",
+          "expr": "histogram_quantile(0.95, sum(rate(ollama_load_duration_seconds_bucket[$__rate_interval])) by (le, model))",
           "format": "time_series",
           "refId": "A"
         }
@@ -504,7 +518,22 @@
   "schemaVersion": 41,
   "tags": [],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "label": "Prometheus",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      }
+    ]
   },
   "time": {
     "from": "now-30m",

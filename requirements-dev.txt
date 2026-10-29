@@ -1,7 +1,2 @@
-# Runtime and test dependencies needed to run `pytest`.
-fastapi
-uvicorn
-prometheus-client
-httpx
-pytest
-anyio
+-r requirements.txt
+pytest==9.2.0

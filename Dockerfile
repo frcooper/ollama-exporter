@@ -4,11 +4,14 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Copy required files
+# Install the same tested dependencies as local deployments. Copy the
+# application afterwards so source edits can reuse this layer.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY ollama_exporter.py .
 
-# Install dependencies
-RUN pip install fastapi uvicorn prometheus_client httpx anyio
+RUN useradd --create-home --uid 10001 exporter
+USER exporter
 
 # Expose the metrics port
 EXPOSE 8000
