@@ -1,0 +1,6 @@
+# Runtime and test dependencies needed to run `pytest`.
+fastapi
+uvicorn
+prometheus-client
+httpx
+pytest
