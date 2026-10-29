@@ -290,8 +290,9 @@ python -m pytest -q
 python -m pip check
 ```
 
-Tests use a simulated upstream and do not require Ollama, downloaded models, or
-a GPU. CI runs the tests on Python 3.11–3.14 and checks that the container builds.
+The automated suite uses a simulated upstream and does not require Ollama,
+downloaded models, or a GPU. CI runs the tests on Python 3.11–3.14 and checks
+that the container builds.
 Direct dependencies are pinned in `requirements.txt`; Docker uses that same
 file. Dependabot checks Python packages, the Docker base, and Actions monthly.
 The CI workflow validates changes and does not publish images or releases.
@@ -305,6 +306,22 @@ required for this single-maintainer repository.
 CI uses a read-only `GITHUB_TOKEN`, does not retain checkout credentials, and
 cannot approve pull requests. Fork workflows from first-time contributors
 require maintainer approval.
+
+## Live Validation
+
+Main commit `090cd9e` was validated on 2026-10-29 against live Ollama and
+Grafana/VictoriaMetrics services:
+
+- 57 automated tests and the dependency check passed.
+- 16 live application checks passed, including native Windows startup, WSLC
+  execution, native and OpenAI-compatible streaming, embeddings, cancellation,
+  and inference deadlines.
+- All 18 dashboard queries returned data, and both dashboards rendered all
+  14 panels with the existing data source selected automatically.
+
+See the [dated validation record and screenshots](docs/validation/2026-10-29.md)
+for the tested versions, scope, and cleanup. This live acceptance check is
+separate from the simulated-upstream tests run by CI.
 
 ## License
 There is no spoon.
