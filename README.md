@@ -1,6 +1,15 @@
 # Ollama Prometheus Exporter
 
-This is a **Prometheus Exporter** for **Ollama**, designed to monitor request statistics, response times, token usage, and model performance. It runs as a FastAPI service and is **Docker-ready**.
+A Prometheus exporter and HTTP proxy for Ollama. Point applications at the
+exporter to collect request counts, timings, and token usage while forwarding
+their requests to Ollama. Run it locally or in Docker.
+
+```text
+Application -> Exporter :8000 -> Ollama :11434
+Prometheus  -> Exporter :8000/metrics
+```
+
+Requests sent directly to Ollama are not visible to the exporter.
 
 ## Features
 - **Tracks chat, generation, and embedding requests per model** (`ollama_requests_total`)
@@ -23,17 +32,30 @@ This is a **Prometheus Exporter** for **Ollama**, designed to monitor request st
 #### 1. Install Dependencies
 Use Python 3.11 or newer. A virtual environment is recommended.
 
+Linux or macOS:
+
 ```sh
 python -m venv .venv
-# Linux/macOS: source .venv/bin/activate
-# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
+
+Windows PowerShell (activation is not required):
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Replace `-3.12` with your installed Python version, 3.11 or newer.
 
 #### 2. Run the Exporter
 ```sh
 python ollama_exporter.py
 ```
+
+On Windows, use `.\.venv\Scripts\python.exe ollama_exporter.py`.
+
 By default, it connects to `http://localhost:11434` for Ollama and listens on
 `[::]:8000`, a dual-stack socket reachable over both IPv6 and IPv4.
 
@@ -52,15 +74,31 @@ The request deadline covers the whole exchange, from sending the request to
 the last streamed byte. It applies to inference only: `POST` on `/api/chat`,
 `/api/generate`, `/api/embed`, `/api/embeddings` and any `/v1/*` endpoint.
 Model pulls, pushes and listings are not limited. A request that hits the
-deadline before Ollama answered gets a `504`; one that is already streaming
-has its stream ended. Either way the upstream connection is closed, which is
-what makes Ollama stop generating.
+deadline before Ollama answered gets a `504`. If the response has already
+started, the connection closes with an incomplete response so the client can
+detect the interruption. Either way the upstream connection is closed, which
+is what makes Ollama stop generating. Disabling the total deadline leaves
+the upstream connection and read timeouts in place (900 seconds each).
 
-#### 3. Run the Tests (optional)
-```sh
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-```
+#### 3. Connect Your Application
+
+Set your application's Ollama connection URL to the exporter, for example
+`http://localhost:8000`, using an address reachable from that application.
+Set the exporter's `OLLAMA_HOST` to the actual Ollama server.
+
+For Open WebUI, use **Admin Panel > Settings > Connections** to set its Ollama
+URL. For a new deployment, `OLLAMA_BASE_URL=http://localhost:8000` can provide
+the initial setting. Saved connection settings can override environment
+variables; see the [Open WebUI connection documentation](https://docs.openwebui.com/troubleshooting/connection-error/).
+
+If Open WebUI runs in Docker, use the exporter service name on a shared Docker
+network or a reachable host address. `localhost` in that container refers to
+Open WebUI's own container.
+
+For OpenAI-compatible clients, use the exporter URL with `/v1`, for example
+`http://localhost:8000/v1`. Request and token metrics are collected on
+`/v1/chat/completions` and `/v1/completions`; streamed token counts require
+`stream_options.include_usage`.
 
 ### Running with Docker
 
@@ -170,10 +208,11 @@ Suppose you want to monitor your local Ollama instance with Prometheus using thi
    # or with Docker:
    # docker run -d -p 8000:8000 -e OLLAMA_HOST="http://host.docker.internal:11434" ollama-exporter
    ```
-3. **Configure your application (eg Open WebUI)** to use the exporter as the API endpoint:
-   - Set `OLLAMA_HOST=http://localhost:8000` (the exporter will proxy and collect metrics).
+3. **Configure your application** to use `http://localhost:8000` as its Ollama
+   connection URL. For Open WebUI, update the Ollama connection in its admin
+   settings. Keep the exporter's own `OLLAMA_HOST` pointed at Ollama.
 4. **Prometheus** scrapes metrics from the exporter:
-   - Add `localhost:8000/metrics` to your Prometheus scrape config.
+   - Set the scrape target to `localhost:8000`; Prometheus uses `/metrics` by default.
 
 This setup routes Ollama traffic through the exporter for monitoring with
 Prometheus and Grafana.
@@ -196,6 +235,16 @@ a GPU. CI runs the tests on Python 3.11–3.14 and checks that the container bui
 Direct dependencies are pinned in `requirements.txt`; Docker uses that same
 file. Dependabot checks Python packages, the Docker base, and Actions monthly.
 The CI workflow validates changes and does not publish images or releases.
+
+Changes to `main` go through a pull request. The four Python checks and the
+container build must pass, the branch must be current with `main`, and review
+conversations must be resolved. These rules also apply to administrators;
+force pushes and deletion of `main` are disabled. No second reviewer is
+required for this single-maintainer repository.
+
+CI uses a read-only `GITHUB_TOKEN`, does not retain checkout credentials, and
+cannot approve pull requests. Fork workflows from first-time contributors
+require maintainer approval.
 
 ## License
 There is no spoon.
