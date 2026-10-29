@@ -18,7 +18,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 4,
+  "id": null,
   "links": [],
   "liveNow": false,
   "panels": [
@@ -177,15 +177,16 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "ollama_requests_total",
-          "instant": false,
+          "expr": "sum by (model) (increase(ollama_requests_total[$__range]))",
+          "instant": true,
           "legendFormat": "{{model}}",
-          "range": true,
+          "range": false,
           "refId": "A"
         }
       ],
-      "title": "Total Requests by Model",
-      "type": "stat"
+      "title": "Requests by Model (Selected Range)",
+      "type": "stat",
+      "description": "Estimated requests in the selected time range, adjusted for counter resets. Prometheus needs at least two samples per series; requests before its first scrape cannot be recovered."
     },
     {
       "datasource": {
@@ -782,7 +783,7 @@
             "uid": "${DS_PROMETHEUS}"
           },
           "editorMode": "code",
-          "expr": "sum by (model) (ollama_requests_total)",
+          "expr": "sum by (model) (increase(ollama_requests_total[$__range]))",
           "format": "table",
           "instant": true,
           "legendFormat": "__auto",
@@ -830,7 +831,7 @@
             },
             "indexByName": {},
             "renameByName": {
-              "Value #A": "Total Requests",
+              "Value #A": "Requests in Range",
               "Value #B": "Avg Response Time",
               "Value #C": "Avg Tokens/Second",
               "model": "Model"
@@ -838,7 +839,8 @@
           }
         }
       ],
-      "type": "table"
+      "type": "table",
+      "description": "Estimated requests in the selected time range, adjusted for counter resets. Prometheus needs at least two samples per series; requests before its first scrape cannot be recovered."
     }
   ],
   "refresh": "5s",
@@ -851,15 +853,12 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "selected": false,
-          "text": "prometheus",
-          "value": "c09d1a89-4ff3-4c52-b8d5-dba793da5d90"
-        },
+        "current": {},
         "hide": 0,
         "includeAll": false,
         "multi": false,
         "name": "DS_PROMETHEUS",
+        "label": "Prometheus",
         "options": [],
         "query": "prometheus",
         "refresh": 1,

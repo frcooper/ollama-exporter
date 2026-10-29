@@ -4,6 +4,7 @@ import asyncio
 import httpx
 import json
 import logging
+import math
 import socket
 from urllib.parse import urlsplit
 
@@ -42,10 +43,12 @@ INFERENCE_PATHS = frozenset({"/api/chat", "/api/generate", "/api/embed", "/api/e
 
 # Endpoints whose final record carries Ollama's native stats (NDJSON).
 NATIVE_METRICS_PATHS = frozenset({"/api/chat", "/api/generate"})
+# Embedding responses contain native stats without a "done" marker.
+EMBEDDING_METRICS_PATHS = frozenset({"/api/embed", "/api/embeddings"})
 # OpenAI-compatible endpoints whose responses carry a `usage` object.
 OPENAI_METRICS_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
 # Endpoints counted in ollama_requests_total.
-COUNTED_PATHS = NATIVE_METRICS_PATHS | OPENAI_METRICS_PATHS
+COUNTED_PATHS = NATIVE_METRICS_PATHS | EMBEDDING_METRICS_PATHS | OPENAI_METRICS_PATHS
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -54,7 +57,7 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
 app = FastAPI()
 
-OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat requests", ["model"])
+OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat, generate and embedding requests", ["model"])
 OLLAMA_INFLIGHT = Gauge("ollama_inflight_requests", "Inference requests currently proxied to Ollama", ["model"])
 
 OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model"])
@@ -123,8 +126,20 @@ def sanitize_response_headers(headers):
     dropped = HOP_BY_HOP_HEADERS | SERVER_OWNED_HEADERS
     if "content-encoding" not in headers:
         dropped = dropped - {"content-length"}
+    dropped |= {name.strip().lower() for name in headers.get("connection", "").split(",")}
     # .raw keeps the bytes as received, so no header can fail to re-encode.
     return [(k.lower(), v) for k, v in headers.raw if k.lower().decode("latin-1") not in dropped]
+
+
+def positive_stat(response_data, name):
+    """Ignore absent or invalid telemetry without interrupting the proxy."""
+    value = response_data.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    try:
+        return value if math.isfinite(value) and value > 0 else 0
+    except OverflowError:
+        return 0
 
 
 def extract_and_record_metrics(response_data, model):
@@ -133,21 +148,21 @@ def extract_and_record_metrics(response_data, model):
     Parameters
     ----------
     response_data : dict
-        Final native response record (the one with ``"done": true``), holding
-        Ollama's durations in nanoseconds and its token counts.
+        Native completion or embedding response, holding Ollama's durations
+        in nanoseconds and its token counts.
     model : str
         Model label, taken from the request body.
     """
     if not isinstance(response_data, dict):
         return
 
-    # https://github.com/ollama/ollama/blob/main/docs/api.md#response
-    total_duration = response_data.get("total_duration", 0) # total time spent in nanoseconds generating the response
-    load_duration = response_data.get("load_duration", 0) # time spent in nanoseconds loading the model
-    prompt_eval_duration = response_data.get("prompt_eval_duration", 0) # time spent in nanoseconds evaluating the prompt
-    prompt_eval_count = response_data.get("prompt_eval_count", 0) # number of tokens in the prompt
-    eval_duration = response_data.get("eval_duration", 0) # time spent in nanoseconds generating the response
-    eval_count = response_data.get("eval_count", 0) # number of tokens in the response
+    # https://docs.ollama.com/api/embed and https://docs.ollama.com/api/chat
+    total_duration = positive_stat(response_data, "total_duration")
+    load_duration = positive_stat(response_data, "load_duration")
+    prompt_eval_duration = positive_stat(response_data, "prompt_eval_duration")
+    prompt_eval_count = positive_stat(response_data, "prompt_eval_count")
+    eval_duration = positive_stat(response_data, "eval_duration")
+    eval_count = positive_stat(response_data, "eval_count")
 
     if total_duration > 0:
         total_duration_seconds = total_duration / 1_000_000_000
@@ -225,7 +240,7 @@ class MetricsTap:
     ----------
     path : str
         Request path, which decides the body format: native NDJSON for
-        :data:`NATIVE_METRICS_PATHS`, OpenAI JSON or SSE for
+        :data:`NATIVE_METRICS_PATHS`, JSON for embedding endpoints, JSON or SSE for
         :data:`OPENAI_METRICS_PATHS`, nothing at all for anything else.
     model : str
         Model label to record the metrics under.
@@ -235,6 +250,8 @@ class MetricsTap:
         """Initialise an empty tap for one response (see class docstring)."""
         if path in NATIVE_METRICS_PATHS:
             self.kind = "native"
+        elif path in EMBEDDING_METRICS_PATHS:
+            self.kind = "embedding"
         elif path in OPENAI_METRICS_PATHS:
             self.kind = "openai"
         else:
@@ -267,7 +284,7 @@ class MetricsTap:
         self._buffer = b""
         if self._final is None:
             return
-        if self.kind == "native":
+        if self.kind in {"native", "embedding"}:
             extract_and_record_metrics(self._final, self.model)
         else:
             record_openai_usage(self._final, self.model)
@@ -292,6 +309,8 @@ class MetricsTap:
         if not isinstance(data, dict):
             return
         if self.kind == "native" and data.get("done"):
+            self._final = data
+        elif self.kind == "embedding":
             self._final = data
         elif self.kind == "openai" and isinstance(data.get("usage"), dict):
             self._final = data
@@ -361,9 +380,9 @@ class UpstreamProxyResponse(Response):
         HTTP method to use upstream.
     url : str
         Full upstream URL.
-    headers : dict of str to str
+    headers : list of tuple of (bytes, bytes)
         Request headers to forward.
-    params : starlette.datastructures.QueryParams
+    params : list of tuple of (str, str)
         Query string to forward.
     body : bytes
         Request body to forward.
@@ -476,6 +495,9 @@ class UpstreamProxyResponse(Response):
                 f"{self.deadline:g}s request deadline, aborting it upstream"
             )
             await self._fail(send, started, 504, "request deadline exceeded")
+        except httpx.TimeoutException as exc:
+            logger.warning(f"Upstream timeout on {self.method} {path}: {exc!r}")
+            await self._fail(send, started, 504, "upstream request timed out")
         except httpx.HTTPError as exc:
             logger.error(f"Upstream error on {self.method} {path}: {exc!r}")
             await self._fail(send, started, 502, f"upstream error: {exc}")
@@ -547,18 +569,23 @@ async def proxy(request: Request, path: str):
     model = model_from_body(body) if request.method == "POST" else "unknown"
     logger.debug(f"Proxying {request.method} request to {endpoint}")
 
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)
+    # The request body is relayed unchanged, so retain its content encoding
+    # while letting httpx recalculate framing. Preserve repeated headers.
+    dropped = (HOP_BY_HOP_HEADERS - {"content-encoding"}) | {"host"}
+    dropped |= {name.strip().lower() for name in request.headers.get("connection", "").split(",")}
+    headers = [
+        (name, value) for name, value in request.headers.raw
+        if name.decode("latin-1").lower() not in dropped
+    ]
 
     if request.method == "POST" and endpoint in COUNTED_PATHS:
         OLLAMA_CHAT_REQUEST_COUNT.labels(model=model).inc()
 
     return UpstreamProxyResponse(
         method=request.method,
-        url=f"{OLLAMA_HOST}{endpoint}",
+        url=f"{OLLAMA_HOST.rstrip('/')}{endpoint}",
         headers=headers,
-        params=request.query_params,
+        params=request.query_params.multi_items(),
         body=body,
         model=model,
         deadline=REQUEST_TIMEOUT if inference and REQUEST_TIMEOUT > 0 else None,

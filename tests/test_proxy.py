@@ -241,6 +241,8 @@ def run_scenario(monkeypatch, upstream, scenario, request_timeout=None):
         ("/api/chat", {"model": "m", "stream": True}, "stream"),
         ("/api/chat", {"model": "m", "stream": False}, "hang"),
         ("/api/generate", {"model": "m"}, "hang"),
+        ("/api/embed", {"model": "m", "input": "hello"}, "hang"),
+        ("/api/embeddings", {"model": "m", "prompt": "hello"}, "hang"),
     ],
 )
 def test_client_disconnect_closes_upstream(monkeypatch, path, payload, mode):
@@ -292,12 +294,13 @@ def test_deadline_ends_a_stream_that_never_stops(monkeypatch):
     run_scenario(monkeypatch, lambda: FakeOllama("stream"), scenario, request_timeout=0.5)
 
 
-def test_deadline_before_headers_returns_504(monkeypatch):
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/api/embed", "/api/embeddings"])
+def test_deadline_before_headers_returns_504(monkeypatch, path):
     """A request still waiting for Ollama at the deadline gets a 504."""
 
     async def scenario(fake, port):
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(raw_post("/v1/chat/completions", {"model": "m"}))
+        writer.write(raw_post(path, {"model": "m"}))
         await writer.drain()
         data = await asyncio.wait_for(reader.read(4096), PROPAGATION_TIMEOUT)
         assert data.startswith(b"HTTP/1.1 504")
