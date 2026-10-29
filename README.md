@@ -131,6 +131,66 @@ The container runs as an unprivileged user. The exporter forwards Ollama's API,
 including model management operations, and adds no authentication of its own.
 Keep it on a trusted network or behind an authenticated reverse proxy.
 
+### Running with WSL Containers (`wslc`)
+
+Run these commands from Windows PowerShell in the repository directory.
+`wslc` builds the existing Dockerfile and runs it with WSL's container engine.
+It requires WSL 2.9.3 or newer; see Microsoft's
+[WSL container setup guide](https://learn.microsoft.com/en-us/windows/wsl/tutorials/wsl-containers).
+
+Check that the commands are available:
+
+```powershell
+wsl --version
+wslc version
+```
+
+If your WSL installation does not include `wslc`, update it with `wsl --update`.
+
+Build the image, then start the exporter with Ollama running on Windows:
+
+```powershell
+wslc build --tag ollama-exporter .
+wslc run --detach --name ollama-exporter --publish 8000:8000 --env OLLAMA_HOST=http://host.wslc.internal:11434 ollama-exporter
+```
+
+`host.wslc.internal` is the default name for reaching the Windows host from a
+WSL container. If Ollama runs on another machine, replace that URL with its
+reachable address. `localhost` inside this container refers to the exporter
+container itself.
+
+Verify both the proxy and metrics from Windows:
+
+```powershell
+curl.exe --fail http://localhost:8000/api/version
+curl.exe --fail http://localhost:8000/metrics
+wslc logs --tail 50 ollama-exporter
+```
+
+Configure applications to use `http://localhost:8000` when they run on the
+Windows host, and use `localhost:8000` as the Prometheus scrape target there.
+Published ports bind to Windows loopback (`127.0.0.1`) by default. For access
+from other machines, configure the publishing address intentionally using
+the [WSL container networking settings](https://learn.microsoft.com/en-us/windows/wsl/wsl-container-settings)
+and allow the chosen port through Windows Firewall.
+
+If Ollama is already running in a WSL container named `ollama`, you can connect
+both containers to a shared network instead:
+
+```powershell
+wslc network create ollama-monitoring
+wslc network connect --network-alias ollama ollama-monitoring ollama
+wslc run --detach --name ollama-exporter --network ollama-monitoring --publish 8000:8000 --env OLLAMA_HOST=http://ollama:11434 ollama-exporter
+```
+
+Use one of the two exporter run commands above. Stop and remove the exporter
+before recreating it with the same name or switching upstream configurations:
+
+```powershell
+wslc stop ollama-exporter
+wslc remove ollama-exporter
+```
+
 ## Prometheus Integration
 
 ### Add to `prometheus.yml`
