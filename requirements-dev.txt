@@ -4,3 +4,4 @@ uvicorn
 prometheus-client
 httpx
 pytest
+anyio

@@ -5,11 +5,13 @@ import httpx
 import json
 import logging
 import socket
+from urllib.parse import urlsplit
+
+import anyio
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse
 
 import uvicorn
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 # Default values, overridable via environment variables or CLI arguments.
 # CLI arguments take precedence over environment variables (see parse_args).
@@ -17,6 +19,8 @@ DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_LISTEN_HOST = "::"  # dual-stack: binds both IPv6 and IPv4
 DEFAULT_LISTEN_PORT = 8000
 DEFAULT_LOG_LEVEL = "INFO"
+# Total deadline, in seconds, for one inference request (0 disables it).
+DEFAULT_REQUEST_TIMEOUT = 1800.0
 
 # Fallback when the host has no usable IPv6 stack (see bind_listen_socket).
 IPV4_WILDCARD = "0.0.0.0"
@@ -29,6 +33,20 @@ IPV6_WILDCARDS = frozenset({"::", "[::]", "::0"})
 # backward compatibility for code paths that import this module directly.
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
 
+# Total deadline applied to inference requests, populated the same way.
+REQUEST_TIMEOUT = float(os.getenv("EXPORTER_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT))
+
+# Native endpoints that run a model. Any POST under /v1/ (Ollama's OpenAI
+# compatible API) counts as well, see is_inference().
+INFERENCE_PATHS = frozenset({"/api/chat", "/api/generate", "/api/embed", "/api/embeddings"})
+
+# Endpoints whose final record carries Ollama's native stats (NDJSON).
+NATIVE_METRICS_PATHS = frozenset({"/api/chat", "/api/generate"})
+# OpenAI-compatible endpoints whose responses carry a `usage` object.
+OPENAI_METRICS_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
+# Endpoints counted in ollama_requests_total.
+COUNTED_PATHS = NATIVE_METRICS_PATHS | OPENAI_METRICS_PATHS
+
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 LOG_LEVEL = os.getenv("LOG_LEVEL", DEFAULT_LOG_LEVEL).upper()
@@ -37,6 +55,7 @@ logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 app = FastAPI()
 
 OLLAMA_CHAT_REQUEST_COUNT = Counter("ollama_requests_total", "Total chat requests", ["model"])
+OLLAMA_INFLIGHT = Gauge("ollama_inflight_requests", "Inference requests currently proxied to Ollama", ["model"])
 
 OLLAMA_TOTAL_DURATION =       Histogram("ollama_response_seconds", "Total time spent for the response", ["model"])
 OLLAMA_LOAD_DURATION =        Histogram("ollama_load_duration_seconds", "Time spent loading the model", ["model"])
@@ -75,26 +94,50 @@ HOP_BY_HOP_HEADERS = frozenset({
     "upgrade",
 })
 
+# Headers uvicorn always adds itself; forwarding Ollama's too would send them
+# twice (`date: X, X`, `server: uvicorn, uvicorn`).
+SERVER_OWNED_HEADERS = frozenset({"date", "server"})
+
 
 def sanitize_response_headers(headers):
     """Strip hop-by-hop headers from an upstream response before forwarding.
 
+    ``Content-Length`` is kept when the upstream body has no
+    ``Content-Encoding``: httpx then hands the bytes over untouched, so the
+    length still matches and clients keep download sizes, HEAD answers and a
+    way to detect a truncated body. Uvicorn frames the response with it
+    instead of switching to chunked encoding.
+
     Parameters
     ----------
-    headers : Mapping[str, str]
+    headers : httpx.Headers
         Headers as returned by the upstream Ollama response.
 
     Returns
     -------
-    dict of str to str
-        The same headers minus every entry in :data:`HOP_BY_HOP_HEADERS`, safe
-        to hand back to Starlette which recomputes the framing itself.
+    list of tuple of (bytes, bytes)
+        Raw ASGI header pairs, lower-cased names, repeated headers preserved,
+        minus every entry in :data:`HOP_BY_HOP_HEADERS` and
+        :data:`SERVER_OWNED_HEADERS`.
     """
-    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+    dropped = HOP_BY_HOP_HEADERS | SERVER_OWNED_HEADERS
+    if "content-encoding" not in headers:
+        dropped = dropped - {"content-length"}
+    # .raw keeps the bytes as received, so no header can fail to re-encode.
+    return [(k.lower(), v) for k, v in headers.raw if k.lower().decode("latin-1") not in dropped]
 
 
 def extract_and_record_metrics(response_data, model):
-    """Extract and record metrics from Ollama response data."""
+    """Extract and record metrics from Ollama response data.
+
+    Parameters
+    ----------
+    response_data : dict
+        Final native response record (the one with ``"done": true``), holding
+        Ollama's durations in nanoseconds and its token counts.
+    model : str
+        Model label, taken from the request body.
+    """
     if not isinstance(response_data, dict):
         return
 
@@ -135,91 +178,399 @@ def extract_and_record_metrics(response_data, model):
 
 @app.get("/metrics")
 def metrics():
-    """Expose Prometheus metrics."""
+    """Expose Prometheus metrics.
+
+    Returns
+    -------
+    fastapi.Response
+        Every registered metric in the Prometheus text format.
+    """
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-@app.post("/api/chat")
-@app.post("/api/generate")
-async def chat_with_metrics(request: Request):
-    """Handle chat and generate requests with streaming support and metrics extraction."""
-    body = await request.json()
-    model = body.get("model", "unknown")
-    # logger.debug(f"Chat request body: {json.dumps(body, indent=4)}")
-    is_streaming = body.get("stream", False)
+def record_openai_usage(response_data, model):
+    """Record token counts from an OpenAI-compatible (``/v1``) response.
 
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)
-    headers.pop("content-type", None)
+    Ollama's OpenAI layer reports no durations, only a ``usage`` object, so
+    only the token counters can be fed from it.
 
-    OLLAMA_CHAT_REQUEST_COUNT.labels(model=model).inc()
+    Parameters
+    ----------
+    response_data : dict
+        Decoded completion object, or the last streamed chunk carrying
+        ``usage`` (sent when the client asks for ``stream_options.include_usage``).
+    model : str
+        Model label, taken from the request body.
+    """
+    usage = response_data.get("usage") if isinstance(response_data, dict) else None
+    if not isinstance(usage, dict):
+        return
+    prompt_tokens = usage.get("prompt_tokens") or 0
+    completion_tokens = usage.get("completion_tokens") or 0
+    if prompt_tokens > 0:
+        OLLAMA_PROMPT_EVAL_COUNT.labels(model=model).inc(prompt_tokens)
+    if completion_tokens > 0:
+        OLLAMA_EVAL_COUNT.labels(model=model).inc(completion_tokens)
+    logger.debug(f"Model: {model}, OpenAI usage: {prompt_tokens} prompt / {completion_tokens} completion tokens")
 
-    if is_streaming:
-        async def generate_stream():
-            endpoint = request.url.path  # /api/chat or /api/generate
-            async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, read=900.0)) as client:
-                async with client.stream("POST", f"{OLLAMA_HOST}{endpoint}", headers=headers, json=body, params=request.query_params) as response:
 
-                    final_chunk_data = None
+class MetricsTap:
+    """Watch a relayed response body for the record that carries the stats.
 
-                    async for chunk in response.aiter_bytes():
-                        # Forward the chunk immediately to the client
-                        yield chunk
+    The body is fed chunk by chunk as it flows to the client. Lines are
+    reassembled across chunk boundaries, so a JSON record split by the network
+    is still parsed; only the last matching record is kept and recorded once
+    the response completes.
 
-                        # Try to parse the chunk to look for metrics
-                        if chunk:
-                            try:
-                                chunk_text = chunk.decode('utf-8')
-                                lines = chunk_text.strip().split('\n')
+    Parameters
+    ----------
+    path : str
+        Request path, which decides the body format: native NDJSON for
+        :data:`NATIVE_METRICS_PATHS`, OpenAI JSON or SSE for
+        :data:`OPENAI_METRICS_PATHS`, nothing at all for anything else.
+    model : str
+        Model label to record the metrics under.
+    """
 
-                                for line in lines:
-                                    if line.strip():
-                                        try:
-                                            chunk_json = json.loads(line)
-                                            # Check if this is the final chunk (contains "done": true)
-                                            if chunk_json.get("done", False):
-                                                final_chunk_data = chunk_json
-                                        except json.JSONDecodeError:
-                                            continue
+    def __init__(self, path, model):
+        """Initialise an empty tap for one response (see class docstring)."""
+        if path in NATIVE_METRICS_PATHS:
+            self.kind = "native"
+        elif path in OPENAI_METRICS_PATHS:
+            self.kind = "openai"
+        else:
+            self.kind = None
+        self.model = model
+        self._buffer = b""
+        self._final = None
 
-                            except UnicodeDecodeError:
-                                pass
+    def feed(self, chunk):
+        """Consume one body chunk.
 
-                    # Extract metrics from the final chunk if available
-                    if final_chunk_data:
-                        extract_and_record_metrics(final_chunk_data, model)
+        Parameters
+        ----------
+        chunk : bytes
+            Decoded body bytes, exactly as forwarded to the client.
+        """
+        if self.kind is None:
+            return
+        self._buffer += chunk
+        *lines, self._buffer = self._buffer.split(b"\n")
+        for line in lines:
+            self._parse(line)
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
-    else:
-        endpoint = request.url.path  # /api/chat or /api/generate
-        async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, read=900.0)) as client:
-            response = await client.post(f"{OLLAMA_HOST}{endpoint}", headers=headers, json=body, params=request.query_params)
+    def finish(self):
+        """Parse what is left of the body and record the metrics found."""
+        if self.kind is None:
+            return
+        # A non-streaming body is usually a single line with no trailing newline.
+        self._parse(self._buffer)
+        self._buffer = b""
+        if self._final is None:
+            return
+        if self.kind == "native":
+            extract_and_record_metrics(self._final, self.model)
+        else:
+            record_openai_usage(self._final, self.model)
 
-            if response.status_code == 200:
-                try:
-                    response_data = response.json()
-                    extract_and_record_metrics(response_data, model)
-                except (json.JSONDecodeError, TypeError):
-                    pass
+    def _parse(self, line):
+        """Remember ``line`` if it is the record holding the final stats.
 
-            return Response(content=response.content, status_code=response.status_code, headers=sanitize_response_headers(response.headers))
+        Parameters
+        ----------
+        line : bytes
+            One body line, an NDJSON record or an SSE ``data:`` field.
+        """
+        line = line.strip()
+        if self.kind == "openai" and line.startswith(b"data:"):
+            line = line[len(b"data:"):].strip()
+        if not line or line == b"[DONE]":
+            return
+        try:
+            data = json.loads(line)
+        except ValueError:  # JSONDecodeError and UnicodeDecodeError alike
+            return
+        if not isinstance(data, dict):
+            return
+        if self.kind == "native" and data.get("done"):
+            self._final = data
+        elif self.kind == "openai" and isinstance(data.get("usage"), dict):
+            self._final = data
+
+
+def is_inference(method, path):
+    """Tell whether a request makes Ollama run a model.
+
+    Parameters
+    ----------
+    method : str
+        HTTP method of the request.
+    path : str
+        Request path, with its leading slash.
+
+    Returns
+    -------
+    bool
+        ``True`` for POSTs to the native inference endpoints and to any
+        OpenAI-compatible ``/v1`` endpoint. Those get the in-flight gauge and
+        the total deadline; model pulls, pushes and listings do not.
+    """
+    return method == "POST" and (path in INFERENCE_PATHS or path.startswith("/v1/"))
+
+
+def model_from_body(body):
+    """Pull the ``model`` field out of a raw JSON request body.
+
+    Parameters
+    ----------
+    body : bytes
+        Request body as received from the client.
+
+    Returns
+    -------
+    str
+        The model name, or ``"unknown"`` when the body is not a JSON object
+        naming one (Ollama will reject such a request itself).
+    """
+    try:
+        data = json.loads(body) if body else None
+    except ValueError:
+        return "unknown"
+    model = data.get("model") if isinstance(data, dict) else None
+    return model if isinstance(model, str) and model else "unknown"
+
+
+class UpstreamProxyResponse(Response):
+    """ASGI response that relays one request to Ollama as a live stream.
+
+    Every proxied request goes through this class, streaming or not. It owns
+    the whole upstream exchange so that its lifetime is bound to the client's:
+
+    - the body is forwarded chunk by chunk as Ollama produces it, nothing is
+      buffered to the end;
+    - a task listens for ``http.disconnect`` the whole time, including while
+      Ollama has not answered yet (a non-streaming generation sends nothing
+      until it is over, so a failed write would never reveal the hang-up);
+      on disconnect the upstream request is cancelled and its connection
+      closed, which is what makes Ollama stop generating;
+    - an optional total deadline bounds the exchange end to end, unlike
+      httpx's read timeout which a steadily streaming generation never hits.
+
+    Parameters
+    ----------
+    method : str
+        HTTP method to use upstream.
+    url : str
+        Full upstream URL.
+    headers : dict of str to str
+        Request headers to forward.
+    params : starlette.datastructures.QueryParams
+        Query string to forward.
+    body : bytes
+        Request body to forward.
+    model : str
+        Model label for metrics.
+    deadline : float or None
+        Seconds after which the exchange is aborted, ``None`` for no limit.
+    track_inflight : bool
+        Whether this request counts in ``ollama_inflight_requests``.
+    """
+
+    def __init__(self, method, url, headers, params, body, model, deadline, track_inflight):
+        """Store the upstream request to perform (see class docstring)."""
+        super().__init__()
+        self.method = method
+        self.url = url
+        self.forward_headers = headers
+        self.params = params
+        self.forward_body = body
+        self.model = model
+        self.deadline = deadline
+        self.track_inflight = track_inflight
+        self.tap = MetricsTap(urlsplit(url).path, model)
+        # Set right before the last body message: from then on, uvicorn's
+        # receive() answers http.disconnect for a completed response, which
+        # is not the client hanging up.
+        self.finished = False
+
+    async def __call__(self, scope, receive, send):
+        """Run the upstream exchange until it ends or the client leaves.
+
+        Parameters
+        ----------
+        scope : dict
+            ASGI connection scope.
+        receive : callable
+            ASGI receive channel; the request body was already consumed, so
+            the only message left to come is ``http.disconnect``.
+        send : callable
+            ASGI send channel.
+        """
+        if self.track_inflight:
+            OLLAMA_INFLIGHT.labels(model=self.model).inc()
+        try:
+            async with anyio.create_task_group() as task_group:
+
+                async def watch_disconnect():
+                    """Cancel the exchange as soon as the client hangs up."""
+                    while True:
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            if self.finished:
+                                return
+                            logger.info(
+                                f"Client disconnected, cancelling {self.method} "
+                                f"{urlsplit(self.url).path} (model {self.model})"
+                            )
+                            task_group.cancel_scope.cancel()
+                            return
+
+                task_group.start_soon(watch_disconnect)
+                await self._relay(send)
+                # The exchange is over: stop listening for a disconnect.
+                task_group.cancel_scope.cancel()
+        finally:
+            if self.track_inflight:
+                OLLAMA_INFLIGHT.labels(model=self.model).dec()
+
+    async def _relay(self, send):
+        """Perform the upstream request and forward its response.
+
+        Parameters
+        ----------
+        send : callable
+            ASGI send channel to the client.
+        """
+        path = urlsplit(self.url).path
+        client = httpx.AsyncClient(timeout=httpx.Timeout(900.0, read=900.0))
+        upstream = None
+        started = False
+        try:
+            # fail_after(None) imposes no limit.
+            with anyio.fail_after(self.deadline):
+                request = client.build_request(
+                    self.method, self.url, headers=self.forward_headers,
+                    params=self.params, content=self.forward_body,
+                )
+                upstream = await client.send(request, stream=True)
+                await send({
+                    "type": "http.response.start",
+                    "status": upstream.status_code,
+                    "headers": sanitize_response_headers(upstream.headers),
+                })
+                started = True
+                # aiter_bytes() undoes any content-encoding, which is why that
+                # header is stripped by sanitize_response_headers().
+                async for chunk in upstream.aiter_bytes():
+                    self.tap.feed(chunk)
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            # Record before the final send: once the response is complete the
+            # watcher may wake up and cancel this task.
+            if upstream.status_code == 200:
+                self.tap.finish()
+            self.finished = True
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            logger.debug(f"Proxy response: {upstream.status_code} for {self.method} {path}")
+        except TimeoutError:
+            logger.warning(
+                f"{self.method} {path} (model {self.model}) exceeded the "
+                f"{self.deadline:g}s request deadline, aborting it upstream"
+            )
+            await self._fail(send, started, 504, "request deadline exceeded")
+        except httpx.HTTPError as exc:
+            logger.error(f"Upstream error on {self.method} {path}: {exc!r}")
+            await self._fail(send, started, 502, f"upstream error: {exc}")
+        except Exception:
+            # Anything else would escape the task group as an ExceptionGroup
+            # and reach the client as a bare 500 or a stream ended cleanly.
+            logger.exception(f"Proxy failure on {self.method} {path}")
+            await self._fail(send, started, 502, "proxy error")
+        finally:
+            # Closing the connection is what tells Ollama to stop generating.
+            # Shielded, because on a client disconnect we run under a
+            # cancelled scope where any unshielded await would bail out first.
+            with anyio.CancelScope(shield=True):
+                if upstream is not None:
+                    await upstream.aclose()
+                await client.aclose()
+
+    @staticmethod
+    async def _fail(send, started, status, message):
+        """Report an aborted exchange to the client.
+
+        Parameters
+        ----------
+        send : callable
+            ASGI send channel to the client.
+        started : bool
+            Whether the response status line was already sent. If so, the
+            status cannot change any more, so the body is deliberately left
+            unterminated: returning without the final message makes uvicorn
+            drop the connection, and the client sees a truncated response
+            instead of a 200 that looks complete.
+        status : int
+            HTTP status to answer with when nothing was sent yet.
+        message : str
+            Error text, returned in Ollama's ``{"error": ...}`` shape.
+        """
+        if not started:
+            payload = json.dumps({"error": message}).encode()
+            await send({
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body", "body": payload})
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
-async def simple_proxy(request: Request, path: str):
-    """Simple pass-through proxy for all other endpoints."""
-    logger.debug(f"Proxying {request.method} request to /{path}")
+async def proxy(request: Request, path: str):
+    """Relay any request to Ollama, recording metrics on the way.
+
+    Parameters
+    ----------
+    request : fastapi.Request
+        Incoming client request.
+    path : str
+        Request path without its leading slash.
+
+    Returns
+    -------
+    UpstreamProxyResponse
+        Response that performs the upstream exchange when served.
+    """
+    endpoint = f"/{path}"
+    body = await request.body()
+    inference = is_inference(request.method, endpoint)
+    model = model_from_body(body) if request.method == "POST" else "unknown"
+    logger.debug(f"Proxying {request.method} request to {endpoint}")
+
     headers = dict(request.headers)
     headers.pop("host", None)
     headers.pop("content-length", None)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, read=900.0)) as client:
-        response = await client.request(method=request.method, url=f"{OLLAMA_HOST}/{path}", headers=headers, content=await request.body(), params=request.query_params)
+    if request.method == "POST" and endpoint in COUNTED_PATHS:
+        OLLAMA_CHAT_REQUEST_COUNT.labels(model=model).inc()
 
-    logger.debug(f"Proxy response: {response.status_code} for {request.method} /{path}")
-    return Response(content=response.content, status_code=response.status_code, headers=sanitize_response_headers(response.headers))
+    return UpstreamProxyResponse(
+        method=request.method,
+        url=f"{OLLAMA_HOST}{endpoint}",
+        headers=headers,
+        params=request.query_params,
+        body=body,
+        model=model,
+        deadline=REQUEST_TIMEOUT if inference and REQUEST_TIMEOUT > 0 else None,
+        track_inflight=inference,
+    )
 
 async def verify_ollama_connection():
-    """Verify connection to Ollama server at startup."""
+    """Verify connection to Ollama server at startup.
+
+    Only logs the outcome: the exporter starts either way, so a late Ollama
+    does not keep it in a crash loop.
+    """
     logger.debug(f"Verifying connection to Ollama server at {OLLAMA_HOST}")
 
     try:
@@ -248,8 +599,8 @@ def parse_args(argv=None):
     Returns
     -------
     argparse.Namespace
-        Parsed arguments with ``host``, ``port``, ``ollama_host`` and
-        ``log_level`` attributes.
+        Parsed arguments with ``host``, ``port``, ``ollama_host``,
+        ``request_timeout`` and ``log_level`` attributes.
     """
     parser = argparse.ArgumentParser(
         description="Prometheus exporter and metrics-extracting proxy for Ollama."
@@ -270,6 +621,13 @@ def parse_args(argv=None):
         "--ollama-host",
         default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST),
         help="Base URL of the upstream Ollama server (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=float(os.getenv("EXPORTER_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)),
+        help="Total deadline in seconds for one inference request, after "
+             "which it is aborted upstream; 0 disables it (default: %(default)s).",
     )
     parser.add_argument(
         "--log-level",
@@ -332,12 +690,17 @@ def bind_listen_socket(host, port):
 
 
 async def main():
-    """Configure runtime from CLI/env, then start the exporter server."""
-    global OLLAMA_HOST
+    """Configure runtime from CLI/env, then start the exporter server.
+
+    Sets the module-level ``OLLAMA_HOST`` and ``REQUEST_TIMEOUT`` from the
+    parsed arguments before serving, since request handlers read them there.
+    """
+    global OLLAMA_HOST, REQUEST_TIMEOUT
     args = parse_args()
 
     # CLI/env arguments override the module-level defaults set at import time.
     OLLAMA_HOST = args.ollama_host
+    REQUEST_TIMEOUT = args.request_timeout
     logger.setLevel(getattr(logging, args.log_level, logging.INFO))
 
     await verify_ollama_connection()

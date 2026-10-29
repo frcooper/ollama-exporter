@@ -8,7 +8,7 @@ WORKDIR /app
 COPY ollama_exporter.py .
 
 # Install dependencies
-RUN pip install fastapi uvicorn prometheus_client httpx
+RUN pip install fastapi uvicorn prometheus_client httpx anyio
 
 # Expose the metrics port
 EXPOSE 8000
